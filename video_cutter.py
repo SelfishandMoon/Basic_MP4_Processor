@@ -1,10 +1,6 @@
-"""
-MP4 视频批量分割工具
-- 批量导入文件夹内的 MP4 文件
-- 按指定时长分割为多个片段（stream copy，无损快速）
-- 剩余时长不足指定时长则丢弃
-"""
+
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -14,12 +10,63 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QListWidget,
     QProgressBar, QTextEdit, QFileDialog, QGroupBox, QMessageBox,
-    QAbstractItemView,
+    QAbstractItemView, QCheckBox,
 )
 from imageio_ffmpeg import get_ffmpeg_exe
 
 
 FFMPEG = get_ffmpeg_exe()
+
+
+def get_video_info(filepath: str) -> dict:
+    """用 ffmpeg 获取视频信息：时长、分辨率（从 stderr 解析）"""
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"文件不存在: {filepath}")
+
+    cmd = [FFMPEG, "-i", filepath]
+    result = subprocess.run(cmd, capture_output=True,
+                            encoding="utf-8", errors="replace")
+    stderr = result.stderr
+
+    info = {"width": 0, "height": 0, "duration": 0.0}
+
+    # 解析时长
+    for line in stderr.split("\n"):
+        if "Duration:" in line:
+            time_str = line.split("Duration:")[1].split(",")[0].strip()
+            h, m, s = time_str.split(":")
+            info["duration"] = float(h) * 3600 + float(m) * 60 + float(s)
+
+    # 解析视频流分辨率: Stream #0:0(...): Video: ..., 1920x1080, ...
+    for line in stderr.split("\n"):
+        if "Stream #" in line and "Video:" in line:
+            # 在 Video: 描述中查找 WxH 模式
+            match = re.search(r"(\d{2,})x(\d{2,})", line)
+            if match:
+                info["width"] = int(match.group(1))
+                info["height"] = int(match.group(2))
+                break
+
+    if info["width"] == 0 or info["height"] == 0:
+        raise RuntimeError(
+            f"无法获取视频分辨率: {os.path.basename(filepath)}\n"
+            f"ffmpeg 输出:\n{stderr.strip()[-500:]}"
+        )
+
+    return info
+
+
+def calc_480p_size(orig_w: int, orig_h: int) -> tuple:
+    """按 480p 目标高度计算等比缩放后的宽高（偶数对齐）"""
+    target_h = 480
+    # 如果原视频高度 ≤ 480，不需要缩小
+    if orig_h <= target_h:
+        return orig_w, orig_h
+    target_w = round(orig_w * target_h / orig_h)
+    # h264 编码要求宽高为偶数
+    if target_w % 2 != 0:
+        target_w += 1
+    return target_w, target_h
 
 
 def get_video_duration(filepath: str) -> float:
@@ -46,7 +93,8 @@ def get_video_duration(filepath: str) -> float:
     )
 
 
-def split_video(input_path: str, output_dir: str, segment_duration: int, log_callback):
+def split_video(input_path: str, output_dir: str, segment_duration: int,
+                log_callback, downscale_to_480p: bool = False):
     """分割单个视频，返回成功生成的片段数"""
     filename = Path(input_path).stem
     duration = get_video_duration(input_path)
@@ -56,22 +104,42 @@ def split_video(input_path: str, output_dir: str, segment_duration: int, log_cal
         return 0
 
     segment_count = int(duration // segment_duration)
-    log_callback(f"  时长 {duration:.1f}s，切割 {segment_count} 段")
+
+    # 分辨率信息
+    scale_filter = None
+    if downscale_to_480p:
+        info = get_video_info(input_path)
+        orig_w, orig_h = info["width"], info["height"]
+        new_w, new_h = calc_480p_size(orig_w, orig_h)
+        if new_w != orig_w or new_h != orig_h:
+            scale_filter = f"scale={new_w}:{new_h}"
+            log_callback(f"  时长 {duration:.1f}s，切割 {segment_count} 段，降分辨率 {orig_w}x{orig_h} → {new_w}x{new_h}")
+        else:
+            log_callback(f"  时长 {duration:.1f}s，切割 {segment_count} 段 (分辨率 ≤ 480p，无需降低)")
+    else:
+        log_callback(f"  时长 {duration:.1f}s，切割 {segment_count} 段")
 
     success_count = 0
     for i in range(segment_count):
         start = i * segment_duration
         out_path = os.path.join(output_dir, f"{filename}_part{i + 1:03d}.mp4")
-        # stream copy 模式下 -ss 必须在 -i 之前（demuxer 级快速 seek）
+
         cmd = [
             FFMPEG,
             "-y",
             "-ss", str(start),
             "-i", input_path,
             "-t", str(segment_duration),
-            "-c", "copy",
-            out_path,
         ]
+
+        if scale_filter:
+            # 需要重新编码，不能 stream copy
+            cmd += ["-vf", scale_filter, "-c:v", "libx264", "-crf", "23", "-c:a", "copy"]
+        else:
+            cmd += ["-c", "copy"]
+
+        cmd.append(out_path)
+
         proc = subprocess.run(cmd, capture_output=True,
                               encoding="utf-8", errors="replace")
 
@@ -79,10 +147,10 @@ def split_video(input_path: str, output_dir: str, segment_duration: int, log_cal
             log_callback(f"    [{i + 1}/{segment_count}] {os.path.basename(out_path)} ✓")
             success_count += 1
         else:
-            # 失败时输出 ffmpeg 完整 stderr，截取后 500 字符
             err_detail = proc.stderr.strip()[-500:] if proc.stderr else "ffmpeg 无输出"
             log_callback(f"    [{i + 1}/{segment_count}] ✗ 失败")
-            log_callback(f"      命令: ffmpeg -ss {start} -i ... -t {segment_duration} -c copy ...")
+            mode = "scale+encode" if scale_filter else "copy"
+            log_callback(f"      模式: {mode}")
             log_callback(f"      错误: {err_detail}")
 
     return success_count
@@ -97,11 +165,13 @@ class SplitWorker(QThread):
     log = pyqtSignal(str)            # 日志消息
     finished_signal = pyqtSignal()   # 完成信号
 
-    def __init__(self, input_dir: str, output_dir: str, duration: int):
+    def __init__(self, input_dir: str, output_dir: str, duration: int,
+                 downscale_to_480p: bool = False):
         super().__init__()
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.duration = duration
+        self.downscale_to_480p = downscale_to_480p
 
     def run(self):
         mp4_files = sorted(Path(self.input_dir).glob("*.mp4"))
@@ -122,6 +192,7 @@ class SplitWorker(QThread):
                 segments = split_video(
                     str(filepath), self.output_dir, self.duration,
                     lambda msg: self.log.emit(msg),
+                    downscale_to_480p=self.downscale_to_480p,
                 )
                 total_segments += segments
             except Exception as e:
@@ -139,7 +210,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("MP4 视频批量分割工具")
-        self.setMinimumSize(680, 560)
+        self.setMinimumSize(680, 620)
         self._worker = None
 
         central = QWidget()
@@ -184,6 +255,15 @@ class MainWindow(QMainWindow):
         h_dur.addWidget(QLabel("提示：剩余时长不足指定时长会自动丢弃"))
         h_dur.addStretch()
         layout.addWidget(gb_dur)
+
+        # ── 分辨率选项 ──
+        gb_res = QGroupBox("分辨率处理")
+        h_res = QHBoxLayout(gb_res)
+        self.downscale_check = QCheckBox("降低至 480P（标清）/ 保留原长宽比例")
+        self.downscale_check.setToolTip("开启后视频将等比缩放至高度480像素，使用 H.264 重新编码")
+        h_res.addWidget(self.downscale_check)
+        h_res.addStretch()
+        layout.addWidget(gb_res)
 
         # ── 文件列表 + 按钮 ──
         gb_files = QGroupBox("待处理文件")
@@ -270,7 +350,8 @@ class MainWindow(QMainWindow):
         self.log_area.clear()
         self.progress_bar.setValue(0)
 
-        self._worker = SplitWorker(input_dir, output_dir, self.duration_spin.value())
+        self._worker = SplitWorker(input_dir, output_dir, self.duration_spin.value(),
+                                   downscale_to_480p=self.downscale_check.isChecked())
         self._worker.total.connect(self.progress_bar.setMaximum)
         self._worker.progress.connect(self.progress_bar.setValue)
         self._worker.log.connect(self._append_log)
